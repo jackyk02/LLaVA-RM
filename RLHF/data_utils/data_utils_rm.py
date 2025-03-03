@@ -386,7 +386,7 @@ def make_binary_reward_modeling_data_module(
     training_args,
 ):
     if data_args.dataset_path.endswith("json"):
-        train_preference = load_dataset("json", data_files=data_args.dataset_path)[
+        train_preference = load_dataset("json", data_files=data_args.dataset_path, streaming=True)[
             "train"
         ]
         use_data_frame = False
