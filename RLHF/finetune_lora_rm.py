@@ -320,6 +320,11 @@ def train():
             model = LlavaLlamaForCausalLM.from_pretrained(
                 model_args.model_name_or_path,
                 cache_dir=training_args.cache_dir,
+                torch_dtype=torch.bfloat16,
+                quantization_config=None,
+                low_cpu_mem_usage=True, 
+                trust_remote_code=True,
+                device_map={"": torch.cuda.current_device()},
             )
 
         vision_tower = model.get_vision_tower()
@@ -368,7 +373,7 @@ def train():
             qlora=True,
             checkpoint_dir=checkpoint_dir,
             tokenizer=tokenizer,
-        ).to(torch.bfloat16)
+        )
 
     model.backbone_model.config.use_cache = False
     print_trainable_parameters(args, model)

@@ -27,12 +27,55 @@ import transformers
 from transformers.trainer_utils import EvalPrediction
 from transformers.utils.generic import ModelOutput
 
-from peft import PeftModel, LoraModel, LoraConfig
+from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training, LoraModel
+from peft.tuners.lora import LoraLayer
 
 from models.qlora_model import get_accelerate_model
 
 from llava.model import *
 
+def load_backbone_model(args, config, adapter_name="lora_default"):
+    """
+    Returns LlavaLlamaForCausalLM: The loaded backbone model with LoRA adapter.
+    """
+    model = LlavaLlamaForCausalLM.from_pretrained(
+        config.backbone_model_name_or_path,
+        device_map={"": torch.cuda.current_device()},
+        torch_dtype=torch.bfloat16,
+        quantization_config=None,
+        low_cpu_mem_usage=True, 
+        trust_remote_code=True,
+    )
+
+    # Configure and apply LoRA adapter
+    lora_config = LoraConfig(
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        target_modules=args.lora_modules,
+        lora_dropout=args.lora_dropout,
+        bias="none",
+        task_type="CAUSAL_LM",
+        init_lora_weights="gaussian",
+    )
+    model = get_peft_model(model, lora_config, adapter_name=adapter_name)
+
+    # Set image-related configurations
+    model.config.image_aspect_ratio = args.image_aspect_ratio
+    model.config.image_grid_pinpoints = args.image_grid_pinpoints
+
+    # Load and configure vision tower
+    vision_tower = model.get_vision_tower()
+    if not vision_tower.is_loaded:
+        vision_tower.load_model()
+    vision_tower.to(device="cuda", dtype=torch.bfloat16)
+    vision_tower.requires_grad_(False)
+
+    # Configure mm_projector
+    mm_projector = model.get_model().mm_projector
+    mm_projector.to(device="cuda", dtype=torch.bfloat16)
+    mm_projector.requires_grad_(False)
+
+    return model
 
 def unpack_dict(
     d: Dict, keys: Sequence[str], return_type: type = tuple
@@ -154,14 +197,8 @@ class RewardModel(transformers.PreTrainedModel):
     ):
         super(RewardModel, self).__init__(config)
         self.adapter_name = adapter_name
-        self.backbone_model = make_generative_vlm(
-            args,
-            config.backbone_model_name_or_path,
-            checkpoint_dir=checkpoint_dir,
-            adapter_name=adapter_name,
-            tokenizer=tokenizer,
-            **kwargs,
-        )
+        self.backbone_model = load_backbone_model(args, config, adapter_name)
+
         hidden_size = get_transformer_hidden_size(self.backbone_model)
         reward_head = nn.Linear(hidden_size, 1)
         torch.nn.init.zeros_(reward_head.bias)

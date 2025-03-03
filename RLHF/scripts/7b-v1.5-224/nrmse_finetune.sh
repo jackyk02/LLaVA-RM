@@ -3,12 +3,12 @@
 set -e
 set -x
 
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export CUDA_VISIBLE_DEVICES=0,1
 export DATA_DIR="/root/LLaVA-RLHF/data_dir"
 export MODEL_DIR="/root/LLaVA-RLHF/model_dir"
 export PYTHONPATH="$PWD:$PYTHONPATH"
-export GPUS_PER_NODE=8
-export OMP_NUM_THREADS=8
+export GPUS_PER_NODE=2
+export OMP_NUM_THREADS=2
 
 # MODEL CONFIG
 VISION_TOWER=openai/clip-vit-large-patch14-336
@@ -29,7 +29,7 @@ export WANDB_ENTITY="skyrobo"  # Replace with your wandb username or organizatio
 # TRAINING CONFIG
 NUM_EPOCHS=20
 LEARNING_RATE=2e-5
-BATCH_SIZE=32
+BATCH_SIZE=2
 GRAD_ACCUMULATION=1
 
 torchrun \
