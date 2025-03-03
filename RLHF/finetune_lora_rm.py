@@ -120,7 +120,7 @@ class TrainingArguments(transformers.Seq2SeqTrainingArguments):
         default=None, metadata={"help": "Length of the response."}
     )
     label_names: List[str] = field(
-        default_factory=lambda: ["index_0", "index_1", "choice"],
+        default_factory=lambda: ["index_0", "index_1", "choice", "nrmse_0", "nrmse_1"],
         metadata={
             "help": "Names of the labels in the dataset. "
             "This is needed to get transformers.Trainer to not throw those tensors away before `compute_loss`."
@@ -191,7 +191,7 @@ class TrainingArguments(transformers.Seq2SeqTrainingArguments):
     weight_decay: float = field(
         default=0.0, metadata={"help": "The L2 weight decay rate of AdamW"}
     )  # use lora dropout instead for regularization if needed
-    learning_rate: float = field(default=0.0002, metadata={"help": "The learnign rate"})
+    learning_rate: float = field(default=0.0002, metadata={"help": "The learning rate"})
     remove_unused_columns: bool = field(
         default=False,
         metadata={"help": "Removed unused columns. Needed to make this codebase work."},
@@ -242,6 +242,61 @@ class TrainingArguments(transformers.Seq2SeqTrainingArguments):
     resume_from_training: bool = field(
         default=False, metadata={"help": "Resume from training"}
     )
+    
+    # FSDP-specific arguments
+    fsdp: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Enable FSDP training. Choose from 'full_shard', 'shard_grad_op', 'hybrid_shard', or 'offload'",
+        },
+    )
+    fsdp_transformer_layer_cls_to_wrap: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Comma separated list of transformer layer class names to wrap with FSDP",
+        },
+    )
+    fsdp_config: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Path to a JSON file containing FSDP configuration",
+        },
+    )
+    fsdp_min_num_params: int = field(
+        default=0,
+        metadata={
+            "help": "FSDP's minimum number of parameters for Default Auto Wrapping",
+        },
+    )
+    # Advanced FSDP configuration
+    fsdp_backward_prefetch: Optional[str] = field(
+        default="backward_pre", 
+        metadata={"help": "FSDP backward prefetch style: 'backward_pre' or 'backward_post'"}
+    )
+    fsdp_forward_prefetch: Optional[bool] = field(
+        default=False, 
+        metadata={"help": "Enable FSDP forward prefetch"}
+    )
+    fsdp_cpu_offload: bool = field(
+        default=False, 
+        metadata={"help": "Enable CPU offloading in FSDP"}
+    )
+    fsdp_state_dict_type: Optional[str] = field(
+        default="sharded",
+        metadata={"help": "FSDP state dict type: 'full', 'sharded', or 'local'"}
+    )
+    fsdp_activation_checkpointing: bool = field(
+        default=False,
+        metadata={"help": "Enable activation checkpointing in FSDP"}
+    )
+    fsdp_use_orig_params: bool = field(
+        default=True,
+        metadata={"help": "Use original parameters in FSDP, needed for gradient checkpointing"}
+    )
+    fsdp_sync_module_states: bool = field(
+        default=True,
+        metadata={"help": "Sync module states at the beginning of training"}
+    )
 
 
 def rank0_print(*args):
@@ -264,6 +319,103 @@ def train():
         **vars(model_args), **vars(data_args), **vars(training_args)
     )
 
+    # Initialize FSDP config if using FSDP
+    fsdp_config = None
+    if args.fsdp:
+        try:
+            # Check if fsdp_config is already a dict (parsed by HuggingFace)
+            if hasattr(args, 'fsdp_config') and isinstance(args.fsdp_config, dict):
+                fsdp_config = args.fsdp_config
+            # Check if it's a string (path to a file)
+            elif hasattr(args, 'fsdp_config') and isinstance(args.fsdp_config, str):
+                with open(args.fsdp_config, "r") as f:
+                    fsdp_config = json.load(f)
+            else:
+                # No valid config provided, create default
+                fsdp_config = {}
+        except Exception as e:
+            # If any error occurs, create a default config
+            print(f"Warning: Error loading FSDP config: {e}")
+            fsdp_config = {}
+        
+        # Setup FSDP configuration
+        from torch.distributed.fsdp import (
+            FullyShardedDataParallel as FSDP,
+            MixedPrecision,
+            BackwardPrefetch,
+            ShardingStrategy,
+            CPUOffload,
+        )
+        from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+        
+        # Get the right sharding strategy as STRING
+        if args.fsdp == "full_shard":
+            sharding_strategy = "FULL_SHARD"
+        elif args.fsdp == "shard_grad_op":
+            sharding_strategy = "SHARD_GRAD_OP"
+        elif args.fsdp == "hybrid_shard":
+            sharding_strategy = "HYBRID_SHARD"
+        else:
+            sharding_strategy = "FULL_SHARD"
+        
+        # Set up backward prefetch as STRING
+        backward_prefetch = args.fsdp_backward_prefetch  # Use the string directly
+        
+        # Setup CPU offload
+        if args.fsdp_cpu_offload:
+            cpu_offload = {"offload_params": True}
+        else:
+            cpu_offload = {"offload_params": False}
+        
+        # Setup mixed precision as dict of strings
+        if args.bf16:
+            mixed_precision = {
+                "param_dtype": "bfloat16",
+                "reduce_dtype": "bfloat16",
+                "buffer_dtype": "bfloat16",
+            }
+        elif args.fp16:
+            mixed_precision = {
+                "param_dtype": "float16",
+                "reduce_dtype": "float16",
+                "buffer_dtype": "float16",
+            }
+        else:
+            mixed_precision = None
+        
+        # Configure wrapping policy
+        auto_wrap_policy = None
+        if hasattr(args, 'fsdp_transformer_layer_cls_to_wrap') and args.fsdp_transformer_layer_cls_to_wrap:
+            # We'll handle the actual wrapping policy later in Trainer
+            # Just record the name of the transformer layer class
+            fsdp_transformer_layer_cls_to_wrap = args.fsdp_transformer_layer_cls_to_wrap
+        
+        # Create final FSDP config
+        fsdp_config.update({
+            "sharding_strategy": sharding_strategy,
+            "backward_prefetch": backward_prefetch,
+            "forward_prefetch": args.fsdp_forward_prefetch,
+            "cpu_offload": cpu_offload,
+            "mixed_precision": mixed_precision,
+            "fsdp_transformer_layer_cls_to_wrap": args.fsdp_transformer_layer_cls_to_wrap if hasattr(args, 'fsdp_transformer_layer_cls_to_wrap') else None,
+            "xla": False,
+            "sync_module_states": args.fsdp_sync_module_states,
+            "use_orig_params": args.fsdp_use_orig_params,
+        })
+        
+        # Set state dict type for saving
+        if args.fsdp_state_dict_type == "full":
+            fsdp_config["state_dict_type"] = "full"
+        elif args.fsdp_state_dict_type == "sharded":
+            fsdp_config["state_dict_type"] = "sharded"
+        else:
+            fsdp_config["state_dict_type"] = "sharded"  # default
+            
+    # Apply FSDP config to training args
+    if fsdp_config:
+        training_args.fsdp_config = fsdp_config
+
+    # Rest of the function remains unchanged
     if args.resume_dir is not None:
         checkpoint_dir, completed_training = args.resume_dir, False
     else:
@@ -316,6 +468,8 @@ def train():
     if model_args.vision_tower is not None:
         from llava.model import LlavaLlamaForCausalLM
 
+        # For FSDP, we need to delay creating the model until after
+        # the FSDP wrapper configuration is complete
         with DisableLogger():
             model = LlavaLlamaForCausalLM.from_pretrained(
                 model_args.model_name_or_path,
@@ -324,7 +478,7 @@ def train():
                 quantization_config=None,
                 low_cpu_mem_usage=True, 
                 trust_remote_code=True,
-                device_map={"": torch.cuda.current_device()},
+                device_map={"": torch.cuda.current_device()} if not args.fsdp else None,
             )
 
         vision_tower = model.get_vision_tower()
@@ -332,10 +486,10 @@ def train():
             vision_tower.load_model()
 
         data_args.image_processor = vision_tower.image_processor
+        
+            
         data_args.is_multimodal = True
-        model.config.mm_use_im_start_end = (
-            data_args.mm_use_im_start_end
-        ) = model_args.mm_use_im_start_end
+        model_args.mm_use_im_start_end = data_args.mm_use_im_start_end = model_args.mm_use_im_start_end
         training_args.use_im_start_end = model_args.mm_use_im_start_end
 
     data_module = make_binary_reward_modeling_data_module(
@@ -428,7 +582,6 @@ def train():
     if args.do_train or args.do_eval:
         with open(os.path.join(args.output_dir, "metrics.json"), "w") as fout:
             fout.write(json.dumps(all_metrics))
-
 
 if __name__ == "__main__":
     train()

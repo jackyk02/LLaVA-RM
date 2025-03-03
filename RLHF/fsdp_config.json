@@ -1,0 +1,9 @@
+{
+  "fsdp_sharding_strategy": 1,
+  "fsdp_offload_params": false,
+  "fsdp_state_dict_type": "sharded",
+  "fsdp_backward_prefetch_policy": "backward_pre",
+  "fsdp_forward_prefetch": true,
+  "fsdp_use_orig_params": true,
+  "fsdp_sync_module_states": true
+}

@@ -36,28 +36,34 @@ from llava.model import *
 
 def load_backbone_model(args, config, adapter_name="lora_default"):
     """
-    Returns LlavaLlamaForCausalLM: The loaded backbone model with LoRA adapter.
+    Returns LlavaLlamaForCausalLM: The loaded backbone model with uniform requires_grad setting.
     """
     model = LlavaLlamaForCausalLM.from_pretrained(
         config.backbone_model_name_or_path,
-        device_map={"": torch.cuda.current_device()},
+        device_map={"": torch.cuda.current_device()} if not getattr(args, "fsdp", None) else None,
         torch_dtype=torch.bfloat16,
         quantization_config=None,
         low_cpu_mem_usage=True, 
         trust_remote_code=True,
     )
 
-    # Configure and apply LoRA adapter
-    lora_config = LoraConfig(
-        r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        target_modules=args.lora_modules,
-        lora_dropout=args.lora_dropout,
-        bias="none",
-        task_type="CAUSAL_LM",
-        init_lora_weights="gaussian",
-    )
-    model = get_peft_model(model, lora_config, adapter_name=adapter_name)
+    # Set uniform requires_grad for FSDP compatibility
+    if args.full_finetune:
+        # Make all parameters trainable for full fine-tuning
+        for param in model.parameters():
+            param.requires_grad = True
+    else:
+        # Configure and apply LoRA adapter
+        lora_config = LoraConfig(
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            target_modules=args.lora_modules,
+            lora_dropout=args.lora_dropout,
+            bias="none",
+            task_type="CAUSAL_LM",
+            init_lora_weights="gaussian",
+        )
+        model = get_peft_model(model, lora_config, adapter_name=adapter_name)
 
     # Set image-related configurations
     model.config.image_aspect_ratio = args.image_aspect_ratio
@@ -67,13 +73,37 @@ def load_backbone_model(args, config, adapter_name="lora_default"):
     vision_tower = model.get_vision_tower()
     if not vision_tower.is_loaded:
         vision_tower.load_model()
-    vision_tower.to(device="cuda", dtype=torch.bfloat16)
-    vision_tower.requires_grad_(False)
+    
+    if not getattr(args, "fsdp", None):
+        vision_tower.to(device="cuda", dtype=torch.bfloat16)
+    else:
+        vision_tower.to(dtype=torch.bfloat16)
+        
+    # For FSDP compatibility with uniform requires_grad
+    if args.full_finetune:
+        # Either make all vision tower parameters trainable too
+        vision_tower.requires_grad_(True)
+    else:
+        # Or keep it frozen if using LoRA
+        vision_tower.requires_grad_(False)
 
     # Configure mm_projector
     mm_projector = model.get_model().mm_projector
-    mm_projector.to(device="cuda", dtype=torch.bfloat16)
-    mm_projector.requires_grad_(False)
+    if not getattr(args, "fsdp", None):
+        mm_projector.to(device="cuda", dtype=torch.bfloat16)
+    else:
+        mm_projector.to(dtype=torch.bfloat16)
+
+    # For FSDP compatibility with uniform requires_grad
+    if args.full_finetune:
+        # Either make mm_projector trainable too (unless explicitly frozen)
+        if getattr(args, "freeze_mm_mlp_adapter", False):
+            mm_projector.requires_grad_(False)
+        else:
+            mm_projector.requires_grad_(True)
+    else:
+        # Or keep it frozen if using LoRA
+        mm_projector.requires_grad_(False)
 
     return model
 
@@ -197,7 +227,14 @@ class RewardModel(transformers.PreTrainedModel):
     ):
         super(RewardModel, self).__init__(config)
         self.adapter_name = adapter_name
-        self.backbone_model = load_backbone_model(args, config, adapter_name)
+        
+        # Handle differently for FSDP and non-FSDP cases
+        if getattr(args, "fsdp", None):
+            # For FSDP, load backbone model differently
+            self.backbone_model = self._load_backbone_model_for_fsdp(args, config, adapter_name)
+        else:
+            # For non-FSDP, use existing method
+            self.backbone_model = load_backbone_model(args, config, adapter_name)
 
         hidden_size = get_transformer_hidden_size(self.backbone_model)
         reward_head = nn.Linear(hidden_size, 1)
@@ -217,17 +254,100 @@ class RewardModel(transformers.PreTrainedModel):
             else:
                 print(f"Warning: reward head not found at {reward_head_path}")
 
-        self.reward_head.requires_grad_(kwargs.get("is_trainable", True))
+        # For FSDP compatibility, make sure reward_head has the same requires_grad as other parameters
+        if args.full_finetune:
+            self.reward_head.requires_grad_(True)
+        else:
+            self.reward_head.requires_grad_(kwargs.get("is_trainable", True))
+    
+    def _load_backbone_model_for_fsdp(self, args, config, adapter_name="lora_default"):
+        """
+        Load backbone model in a way that's compatible with FSDP with uniform requires_grad
+        """
+        from llava.model import LlavaLlamaForCausalLM
+        
+        # For FSDP, we need to avoid device_map and let FSDP handle device placement
+        model = LlavaLlamaForCausalLM.from_pretrained(
+            config.backbone_model_name_or_path,
+            torch_dtype=torch.bfloat16,
+            quantization_config=None,
+            low_cpu_mem_usage=True, 
+            trust_remote_code=True,
+        )
+
+        # Set image-related configurations
+        model.config.image_aspect_ratio = args.image_aspect_ratio
+        model.config.image_grid_pinpoints = args.image_grid_pinpoints
+
+        # Load and configure vision tower
+        vision_tower = model.get_vision_tower()
+        if not vision_tower.is_loaded:
+            vision_tower.load_model()
+        vision_tower.to(dtype=torch.bfloat16)
+
+        # Configure mm_projector
+        mm_projector = model.get_model().mm_projector
+        mm_projector.to(dtype=torch.bfloat16)
+        
+        if args.full_finetune:
+            # For full fine-tuning with FSDP, we need ALL parameters to have the same requires_grad value
+            # This is crucial for FSDP to work properly
+            
+            # First, make everything trainable
+            for name, param in model.named_parameters():
+                param.requires_grad = True
+                
+            # If needed, freeze specific components like vision tower or mm_projector
+            # This must be done by REMOVING these components from the FSDP-wrapped model
+            # rather than just setting requires_grad=False
+            
+            # For now, let's just ensure everything has the same requires_grad value
+            # by removing (detaching) frozen components from the FSDP computation graph
+            
+            if getattr(args, "freeze_mm_mlp_adapter", False):
+                # If we want to freeze mm_mlp_adapter, we need to detach it completely
+                # so it's not part of the FSDP-wrapped parameters
+                # Store the original mm_projector for later use in forward pass
+                model._original_mm_projector = mm_projector
+                
+                # Replace with parameter-less version for FSDP compatibility
+                # (This is a workaround - in production you might use a more sophisticated approach)
+                class DummyModule(nn.Module):
+                    def __init__(self, original_module):
+                        super().__init__()
+                        self.original_module = original_module
+                    
+                    def forward(self, x):
+                        with torch.no_grad():
+                            return self.original_module(x)
+                
+                # Replace mm_projector with dummy version
+                model.get_model().mm_projector = DummyModule(mm_projector)
+                
+        else:
+            # If not doing full fine-tuning, use LoRA
+            lora_config = LoraConfig(
+                r=args.lora_r,
+                lora_alpha=args.lora_alpha,
+                target_modules=args.lora_modules,
+                lora_dropout=args.lora_dropout,
+                bias="none",
+                task_type="CAUSAL_LM",
+                init_lora_weights="gaussian",
+            )
+            model = get_peft_model(model, lora_config, adapter_name=adapter_name)
+
+        return model
 
     def forward(
         self, input_ids, attention_mask=None, images=None, return_dict=True, **kwargs
     ):
-        # We only compute the rewards and don't compute the logistic regression loss in this function so that it's
-        # easier to use for later stages of reranking / RL training.
-        self.backbone_model.set_adapter(self.adapter_name)
+        # Ensure backbone model is using the right adapter if not full fine-tuning
+        # if not hasattr(self, 'args') or not getattr(self.args, 'full_finetune', False):
+        #     self.backbone_model.set_adapter(self.adapter_name)
+        
         self.backbone_model.config.use_cache = False
 
-        # print(input_ids.shape, images.shape, 'images', images.dtype)
         outputs = self.backbone_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -244,14 +364,10 @@ class RewardModel(transformers.PreTrainedModel):
         last_hidden_state = last_hidden_state + 0.0 * torch.mean(logits)
 
         last_hidden_state_at_the_end = last_hidden_state[:, -1, :]
-        # TODO(lxuechen): Make returning rewards at all positions and last_hidden_state an option.
-        # last_hidden_state_at_the_end = last_hidden_state_at_the_end.type_as(
-        #     next(self.reward_head.parameters()) # HACK(sheng): error with data parallel
-        # )
+        # Ensure we're using the right type for computation
         last_hidden_state_at_the_end = last_hidden_state_at_the_end.type_as(
             self.reward_head.weight
         )
-        # print(last_hidden_state_at_the_end.device, self.reward_head.weight.device, self.reward_head.bias.device)
         rewards = self.reward_head(last_hidden_state_at_the_end).squeeze(-1)
         return RewardModelOutput(rewards=rewards) if return_dict else (rewards,)
 

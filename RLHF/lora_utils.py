@@ -16,6 +16,58 @@ from models.reward_model import RewardModel
 
 DEFAULT_PAD_TOKEN = "[PAD]"
 
+class SaveModelCallback(transformers.TrainerCallback):
+    def save_model(self, args, state, kwargs):
+        if state.best_model_checkpoint is not None:
+            checkpoint_folder = os.path.join(
+                state.best_model_checkpoint
+            )
+        else:
+            checkpoint_folder = os.path.join(
+                args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{state.global_step}"
+            )
+
+        # For full fine-tuning, save the entire model
+        if getattr(args, "full_finetune", False):
+            # Handle FSDP specifically
+            if getattr(args, "fsdp", None):
+                # Saving in FSDP mode requires special handling
+                # The model will be saved by the Trainer class based on FSDP config
+                # We just need to save the reward head separately
+                
+                from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+                import torch.distributed as dist
+                
+                # Get reward head state dict based on FSDP state dict type
+                reward_head_path = os.path.join(checkpoint_folder, "reward_head")
+                
+                if dist.get_rank() == 0:
+                    # Only save on rank 0
+                    # Extract reward head state dict - may need special handling for FSDP
+                    try:
+                        reward_head_state = kwargs["model"].reward_head.state_dict()
+                        torch.save(reward_head_state, reward_head_path)
+                    except Exception as e:
+                        print(f"Warning: Failed to save reward head: {e}")
+            else:
+                # Regular non-FSDP full fine-tuning
+                # Save the reward head
+                reward_head_path = os.path.join(checkpoint_folder, "reward_head")
+                torch.save(kwargs["model"].reward_head.state_dict(), reward_head_path)
+                
+                # The base model will be saved by the Trainer
+        else:
+            # For LoRA, use the original SavePeftModelCallback logic
+            peft_model_path = os.path.join(checkpoint_folder, "adapter_model")
+            kwargs["model"].save_pretrained(peft_model_path)
+
+            # Save reward head
+            reward_head_path = os.path.join(checkpoint_folder, "reward_head")
+            torch.save(kwargs["model"].reward_head.state_dict(), reward_head_path)
+
+            pytorch_model_path = os.path.join(checkpoint_folder, "pytorch_model.bin")
+            if os.path.exists(pytorch_model_path):
+                os.remove(pytorch_model_path)
 
 class SavePeftModelCallback(transformers.TrainerCallback):
     def save_model(self, args, state, kwargs):
