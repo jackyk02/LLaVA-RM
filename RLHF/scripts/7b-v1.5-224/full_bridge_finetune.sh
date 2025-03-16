@@ -15,13 +15,13 @@ VISION_TOWER=openai/clip-vit-large-patch14-336
 LM_MODEL_NAME=LLaVA-RLHF-7b-v1.5-224/sft_model/
 
 # DATA CONFIG
-PREFERENCE_DATA=entire_bridge_224_nrmse_ground.json
+PREFERENCE_DATA=low_nrmse_full_bridge.json
 
 # SAVE CONFIG
 MODEL_NAME=LLaVA-RM-7b-full-bridge-lora-bce-mse-rank512-alpha128
 
 # WANDB CONFIG
-export WANDB_PROJECT="full-bridge"
+export WANDB_PROJECT="new-full-bridge"
 export WANDB_NAME="$MODEL_NAME-$(date +%Y%m%d_%H%M%S)"
 export WANDB_ENTITY="skyrobo"  # Replace with your wandb username or organization
 
@@ -66,10 +66,10 @@ torchrun \
     --num_train_epochs $NUM_EPOCHS \
     --group_by_length False \
     --evaluation_strategy "steps" \
-    --eval_steps 250 \
+    --eval_steps 150 \
     --save_strategy "steps" \
-    --save_steps 500 \
-    --save_total_limit 100 \
+    --save_steps 150 \
+    --save_total_limit 150 \
     --weight_decay 0.0 \
     --warmup_ratio 0.03 \
     --lr_scheduler_type "constant_with_warmup" \
