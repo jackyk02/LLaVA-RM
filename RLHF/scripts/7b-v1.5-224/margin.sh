@@ -26,7 +26,7 @@ export WANDB_NAME="$MODEL_NAME-$(date +%Y%m%d_%H%M%S)"
 export WANDB_ENTITY="skyrobo"  # Replace with your wandb username or organization
 
 # TRAINING CONFIG
-NUM_EPOCHS=1
+NUM_EPOCHS=2
 LEARNING_RATE=2e-5
 BATCH_SIZE=16
 GRAD_ACCUMULATION=1
@@ -57,7 +57,7 @@ torchrun \
     --eval_dataset_path $DATA_DIR/$PREFERENCE_DATA \
     --dataset_name "none" \
     --eval_dataset_name "none" \
-    --eval_size 1024 \
+    --eval_size 10240 \
     --bits 16 \
     --lora_r 512 \
     --lora_alpha 128 \

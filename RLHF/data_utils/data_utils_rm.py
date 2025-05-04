@@ -277,32 +277,44 @@ def _get_generator(seed: int) -> torch.Generator:
 
 
 def split_train_into_train_and_eval(
-    train_dataset: Dataset, eval_size: int, seed: int = None
+    train_dataset: Dataset, eval_size: int, seed: int
 ) -> Tuple[Dataset, Dataset]:
     assert eval_size < len(
-        train_dataset
+        train_dataset  # noqa
     ), "Requested eval_size cannot be equal/larger than original train data size."
+    new_train_size = len(train_dataset) - eval_size  # noqa
+    train_dataset, eval_dataset = torch.utils.data.random_split(
+        train_dataset, [new_train_size, eval_size], generator=_get_generator(seed)
+    )
+    return train_dataset, eval_dataset
+
+# def split_train_into_train_and_eval(
+#     train_dataset: Dataset, eval_size: int, seed: int = None
+# ) -> Tuple[Dataset, Dataset]:
+#     assert eval_size < len(
+#         train_dataset
+#     ), "Requested eval_size cannot be equal/larger than original train data size."
     
-    # Calculate sizes
-    total_size = len(train_dataset)
-    batch_size = 32
+#     # Calculate sizes
+#     total_size = len(train_dataset)
+#     batch_size = 32
 
-    # Adjust sizes to be multiples of batch_size
-    new_train_size = (total_size - eval_size) // batch_size * batch_size
-    eval_size = eval_size // batch_size * batch_size
+#     # Adjust sizes to be multiples of batch_size
+#     new_train_size = (total_size - eval_size) // batch_size * batch_size
+#     eval_size = eval_size // batch_size * batch_size
 
-    # Generate indices
-    indices = list(range(total_size))
+#     # Generate indices
+#     indices = list(range(total_size))
 
-    # Split indices into train and eval
-    train_indices = indices[:new_train_size]
-    eval_indices = indices[new_train_size:new_train_size + eval_size]
+#     # Split indices into train and eval
+#     train_indices = indices[:new_train_size]
+#     eval_indices = indices[new_train_size:new_train_size + eval_size]
 
-    # Create subset datasets using indices
-    train_subset = torch.utils.data.Subset(train_dataset, train_indices)
-    eval_subset = torch.utils.data.Subset(train_dataset, eval_indices)
+#     # Create subset datasets using indices
+#     train_subset = torch.utils.data.Subset(train_dataset, train_indices)
+#     eval_subset = torch.utils.data.Subset(train_dataset, eval_indices)
 
-    return train_subset, eval_subset
+#     return train_subset, eval_subset
 
 
 def pad_sequence_from_left(
