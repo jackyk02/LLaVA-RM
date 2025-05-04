@@ -18,7 +18,7 @@ LM_MODEL_NAME=LLaVA-RLHF-7b-v1.5-224/sft_model/
 PREFERENCE_DATA=tight_indices.json
 
 # SAVE CONFIG
-MODEL_NAME=LLaVA-RM-7b-full-bridge-lora-bce-mse-rank512-alpha128-margin
+MODEL_NAME=LLaVA-RM-7b-full-bridge-lora-bce-mse-rank512-alpha128-margin-alphazero
 
 # WANDB CONFIG
 export WANDB_PROJECT="margin"
