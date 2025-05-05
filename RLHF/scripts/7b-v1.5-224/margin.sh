@@ -18,17 +18,17 @@ LM_MODEL_NAME=LLaVA-RLHF-7b-v1.5-224/sft_model/
 PREFERENCE_DATA=tight_indices.json
 
 # SAVE CONFIG
-MODEL_NAME=LLaVA-RM-7b-full-bridge-lora-bce-mse-rank512-alpha128-margin-alphazero
+MODEL_NAME=LLaVA-RM-7b-full-bridge-lora-bce-mse-rank512-alpha128-margin-alpha0
 
 # WANDB CONFIG
-export WANDB_PROJECT="margin"
+export WANDB_PROJECT="margin-h100"
 export WANDB_NAME="$MODEL_NAME-$(date +%Y%m%d_%H%M%S)"
 export WANDB_ENTITY="skyrobo"  # Replace with your wandb username or organization
 
 # TRAINING CONFIG
 NUM_EPOCHS=2
 LEARNING_RATE=2e-5
-BATCH_SIZE=16
+BATCH_SIZE=32
 GRAD_ACCUMULATION=1
 
 torchrun \

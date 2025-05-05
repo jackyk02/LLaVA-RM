@@ -273,7 +273,7 @@ class RewardModelTrainer(transformers.Trainer):
 
         super(RewardModelTrainer, self)._save(output_dir, state_dict)
 
-    def compute_loss(self, model, inputs, return_outputs=False, alpha=1):
+    def compute_loss(self, model, inputs, return_outputs=False, alpha=0):
         """
         Computes the loss for the reward model training.
 
