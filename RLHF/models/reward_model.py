@@ -276,7 +276,6 @@ class RewardModelTrainer(transformers.Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, alpha=0.1):
         """
         Computes the loss for the reward model training.
-
         Args:
             model: The reward model.
             inputs (dict): Dictionary containing input tensors:
@@ -289,7 +288,6 @@ class RewardModelTrainer(transformers.Trainer):
                 - nrmse_0: (bsz, num_pairs) Ground truth metric (e.g., RMSE diff) for candidate index_0
                 - nrmse_1: (bsz, num_pairs) Ground truth metric (e.g., RMSE diff) for candidate index_1
             return_outputs (bool): Whether to return intermediate outputs along with the loss.
-
         Returns:
             torch.Tensor or tuple: The computed loss, or a tuple (loss, outputs_dict) if return_outputs is True.
         """
@@ -313,7 +311,6 @@ class RewardModelTrainer(transformers.Trainer):
         # repeat images to match the number of candidates
         images = images.unsqueeze(1).repeat(1, input_ids.size(1), 1, 1, 1)
         images = einops.rearrange(images, "b n h w c -> (b n) h w c") # Adapt 'h w c' if needed
-
         num_candidates, num_pairs = input_ids.size(1), choice.size(1)
         input_ids_flat, attention_mask_flat = tuple(
             einops.rearrange(x, "b c l -> (b c) l") for x in (input_ids, attention_mask)
@@ -327,86 +324,206 @@ class RewardModelTrainer(transformers.Trainer):
         rewards = einops.rearrange(
             rewards_flat, "(b c) -> b c", c=num_candidates
         )  # Size: (bsz, num_candidates).
-
         # Get rewards for the pairs being compared
         rewards_0, rewards_1 = tuple(
             batch_select(rewards, index) for index in (index_0, index_1)
         )  # Size: (bsz, num_pairs).
 
-        # Original logits calculation: R(a_1) - R(a_0)
-        logits = rewards_1 - rewards_0  # Size: (bsz, num_pairs).
-
-        # --- Start Modification based on the formula ---
-
-        # Ensure choice, nrmse_0, nrmse_1 are on the same device and dtype as logits
-        logits_dtype = logits.dtype
-        logits_device = logits.device
-        choice_float = choice.to(dtype=logits_dtype, device=logits_device)
-        nrmse_0 = nrmse_0.to(dtype=logits_dtype, device=logits_device)
-        nrmse_1 = nrmse_1.to(dtype=logits_dtype, device=logits_device)
-
-        # Identify rewards for the winning (W) and losing (L) actions based on 'choice'
-        # reward_W = R_phi(a_t^W, s_t, I)
-        # reward_L = R_phi(a_t^L, s_t, I)
-        # If choice=1, W is index_1, L is index_0. reward_W=rewards_1, reward_L=rewards_0
-        # If choice=0, W is index_0, L is index_1. reward_W=rewards_0, reward_L=rewards_1
-        reward_W = choice_float * rewards_1 + (1 - choice_float) * rewards_0
-        reward_L = choice_float * rewards_0 + (1 - choice_float) * rewards_1
-
-        # Calculate the predicted reward difference for the chosen pair: R(a_W) - R(a_L)
-        # This should always be positive or zero if the model aligns with 'choice'.
-        # Can be calculated as: (2 * choice_float - 1) * logits
-        predicted_reward_diff = reward_W - reward_L # Equivalent to (2 * choice_float - 1) * logits
-
-        # Calculate predicted preference level: delta_hat = |R(a_W) - R(a_L)|
-        # Note: Based on the formula, it seems delta_hat uses the absolute difference
-        # between the *actual* computed rewards R(a_W) and R(a_L), which is |predicted_reward_diff|.
-        # delta_hat = torch.abs(predicted_reward_diff)
-        # However, the text defines delta_hat as |R(aW) - R(aL)| where aW and aL are the specific
-        # actions chosen. This implies using the absolute value of the difference calculated above.
-        delta_hat = torch.abs(predicted_reward_diff)
-        # An alternative interpretation could be delta_hat = |rewards_1 - rewards_0| = |logits|,
-        # if the formula meant the absolute difference between *any* pair's rewards.
-        # Let's stick to the definition based on R(aW) and R(aL).
-        # delta_hat = torch.abs(reward_W - reward_L) # which is predicted_reward_diff.abs()
-
-        # Identify the ground truth metrics for the winning (W) and losing (L) actions
-        # rmse_W = RMSE(a_t^W, a_t^*)
-        # rmse_L = RMSE(a_t^L, a_t^*)
-        # If choice=1, W is index_1, L is index_0. rmse_W=nrmse_1, rmse_L=nrmse_0
-        # If choice=0, W is index_0, L is index_1. rmse_W=nrmse_0, rmse_L=nrmse_1
-        rmse_W = choice_float * nrmse_1 + (1 - choice_float) * nrmse_0
-        rmse_L = choice_float * nrmse_0 + (1 - choice_float) * nrmse_1
-
-        # Calculate ground truth preference level: delta_star = |RMSE(a_W) - RMSE(a_L)|
-        delta_star = torch.abs(rmse_W - rmse_L)
-        # Note: This simplifies to torch.abs(nrmse_1 - nrmse_0)
-
-        # Define the hyperparameter alpha (should be configured appropriately)
-
-        # Calculate the penalty term: alpha * || delta_star - delta_hat ||^2_2
-        # Note: ||x||^2_2 is just x^2 for scalars.
-        preference_level_penalty = alpha * (delta_star - delta_hat)**2
-
-        # Calculate the argument for the sigmoid function in the loss formula:
-        # R(a_W) - R(a_L) - alpha * || delta_star - delta_hat ||^2_2
-        modified_reward_diff = predicted_reward_diff - preference_level_penalty
-
-        # Calculate the final loss using log sigmoid for numerical stability:
-        # Loss = -E[ log(sigma(modified_reward_diff)) ]
-        # This is equivalent to binary cross-entropy with logits where the target is always 1.
-        loss = -F.logsigmoid(modified_reward_diff).mean()
-
-        # --- End Modification ---
-
-        # Original regularization term (commented out as it's not in the provided formula)
-        # loss = loss + (rewards_1 + rewards_0).mean().abs() * 1e-3
-
-        # Log the original paired rewards for monitoring/debugging if needed
+        # --- MSE Loss Implementation ---
+        
+        # Create a mapping from unique candidate indices to their NRMSE values to avoid duplication
+        bsz = input_ids.size(0)
+        device = rewards.device
+        dtype = rewards.dtype
+        
+        # Flatten indices and NRMSE values for easier processing
+        index_0_flat = index_0.view(-1)  # (bsz * num_pairs,)
+        index_1_flat = index_1.view(-1)  # (bsz * num_pairs,)
+        nrmse_0_flat = nrmse_0.view(-1)  # (bsz * num_pairs,)
+        nrmse_1_flat = nrmse_1.view(-1)  # (bsz * num_pairs,)
+        
+        # Create batch indices for proper indexing
+        batch_indices_0 = torch.arange(bsz, device=device).repeat_interleave(num_pairs)
+        batch_indices_1 = torch.arange(bsz, device=device).repeat_interleave(num_pairs)
+        
+        # Create unique (batch, candidate) pairs and their corresponding NRMSE values
+        unique_pairs = []
+        unique_nrmse = []
+        
+        # Add pairs from index_0 and nrmse_0
+        for i in range(len(batch_indices_0)):
+            unique_pairs.append((batch_indices_0[i].item(), index_0_flat[i].item()))
+            unique_nrmse.append(nrmse_0_flat[i].item())
+        
+        # Add pairs from index_1 and nrmse_1
+        for i in range(len(batch_indices_1)):
+            unique_pairs.append((batch_indices_1[i].item(), index_1_flat[i].item()))
+            unique_nrmse.append(nrmse_1_flat[i].item())
+        
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_pairs_filtered = []
+        unique_nrmse_filtered = []
+        
+        for pair, nrmse in zip(unique_pairs, unique_nrmse):
+            if pair not in seen:
+                seen.add(pair)
+                unique_pairs_filtered.append(pair)
+                unique_nrmse_filtered.append(nrmse)
+        
+        # Extract batch indices and candidate indices
+        batch_idx = [pair[0] for pair in unique_pairs_filtered]
+        candidate_idx = [pair[1] for pair in unique_pairs_filtered]
+        
+        # Get predicted rewards for unique (batch, candidate) pairs
+        pred_rewards = rewards[batch_idx, candidate_idx]  # Shape: (num_unique_pairs,)
+        
+        # Convert NRMSE to target rewards (negate since lower NRMSE should mean higher reward)
+        target_rewards = -torch.tensor(unique_nrmse_filtered, device=device, dtype=dtype)
+        
+        # Compute MSE loss
+        loss = F.mse_loss(pred_rewards, target_rewards)
+        
+        # Log the original paired rewards for monitoring/debugging (same as original)
         logged_rewards = torch.stack((rewards_1, rewards_0), dim=-1)
 
-        # Return loss, and optionally intermediate values for logging
+        # Return loss, and optionally intermediate values for logging (same format as original)
         return (loss, dict(logits=logged_rewards)) if return_outputs else loss
+
+    # def compute_loss(self, model, inputs, return_outputs=False, alpha=0):
+    #     """
+    #     Computes the loss for the reward model training.
+
+    #     Args:
+    #         model: The reward model.
+    #         inputs (dict): Dictionary containing input tensors:
+    #             - input_ids: (bsz, num_candidates, seq_len)
+    #             - attention_mask: (bsz, num_candidates, seq_len)
+    #             - index_0: (bsz, num_pairs) indices for the first candidate in pairs
+    #             - index_1: (bsz, num_pairs) indices for the second candidate in pairs
+    #             - choice: (bsz, num_pairs) 1 if candidate index_1 is preferred, 0 otherwise
+    #             - images: (bsz, h, w, c) or similar image tensor
+    #             - nrmse_0: (bsz, num_pairs) Ground truth metric (e.g., RMSE diff) for candidate index_0
+    #             - nrmse_1: (bsz, num_pairs) Ground truth metric (e.g., RMSE diff) for candidate index_1
+    #         return_outputs (bool): Whether to return intermediate outputs along with the loss.
+
+    #     Returns:
+    #         torch.Tensor or tuple: The computed loss, or a tuple (loss, outputs_dict) if return_outputs is True.
+    #     """
+    #     # input_ids, attention_mask each of size (bsz, num_candidates, seq_len).
+    #     # index_0, index_1 each of size (bsz, num_pairs); indexes into input_ids.
+    #     # choice of size (bsz, num_pairs); 1 if index_1's seq is chosen, 0 otherwise.
+    #     # nrmse_0, nrmse_1 are metrics associated with the candidates indicated by index_0 and index_1 respectively.
+    #     input_ids, attention_mask, index_0, index_1, choice, images, nrmse_0, nrmse_1 = unpack_dict(
+    #         inputs,
+    #         keys=(
+    #             "input_ids",
+    #             "attention_mask",
+    #             "index_0",
+    #             "index_1",
+    #             "choice",
+    #             "images",
+    #             "nrmse_0", # Shape: (bsz, num_pairs)
+    #             "nrmse_1"  # Shape: (bsz, num_pairs)
+    #         ),
+    #     )
+    #     # repeat images to match the number of candidates
+    #     images = images.unsqueeze(1).repeat(1, input_ids.size(1), 1, 1, 1)
+    #     images = einops.rearrange(images, "b n h w c -> (b n) h w c") # Adapt 'h w c' if needed
+
+    #     num_candidates, num_pairs = input_ids.size(1), choice.size(1)
+    #     input_ids_flat, attention_mask_flat = tuple(
+    #         einops.rearrange(x, "b c l -> (b c) l") for x in (input_ids, attention_mask)
+    #     )
+    #     # Assume model outputs a dictionary or object with a 'rewards' attribute
+    #     outputs = model(
+    #         input_ids=input_ids_flat, attention_mask=attention_mask_flat, images=images
+    #     )
+    #     # Assuming outputs.rewards exists and is the raw reward score
+    #     rewards_flat = outputs.rewards
+    #     rewards = einops.rearrange(
+    #         rewards_flat, "(b c) -> b c", c=num_candidates
+    #     )  # Size: (bsz, num_candidates).
+
+    #     # Get rewards for the pairs being compared
+    #     rewards_0, rewards_1 = tuple(
+    #         batch_select(rewards, index) for index in (index_0, index_1)
+    #     )  # Size: (bsz, num_pairs).
+
+    #     # Original logits calculation: R(a_1) - R(a_0)
+    #     logits = rewards_1 - rewards_0  # Size: (bsz, num_pairs).
+
+    #     # --- Start Modification based on the formula ---
+
+    #     # Ensure choice, nrmse_0, nrmse_1 are on the same device and dtype as logits
+    #     logits_dtype = logits.dtype
+    #     logits_device = logits.device
+    #     choice_float = choice.to(dtype=logits_dtype, device=logits_device)
+    #     nrmse_0 = nrmse_0.to(dtype=logits_dtype, device=logits_device)
+    #     nrmse_1 = nrmse_1.to(dtype=logits_dtype, device=logits_device)
+
+    #     # Identify rewards for the winning (W) and losing (L) actions based on 'choice'
+    #     # reward_W = R_phi(a_t^W, s_t, I)
+    #     # reward_L = R_phi(a_t^L, s_t, I)
+    #     # If choice=1, W is index_1, L is index_0. reward_W=rewards_1, reward_L=rewards_0
+    #     # If choice=0, W is index_0, L is index_1. reward_W=rewards_0, reward_L=rewards_1
+    #     reward_W = choice_float * rewards_1 + (1 - choice_float) * rewards_0
+    #     reward_L = choice_float * rewards_0 + (1 - choice_float) * rewards_1
+
+    #     # Calculate the predicted reward difference for the chosen pair: R(a_W) - R(a_L)
+    #     # This should always be positive or zero if the model aligns with 'choice'.
+    #     # Can be calculated as: (2 * choice_float - 1) * logits
+    #     predicted_reward_diff = reward_W - reward_L # Equivalent to (2 * choice_float - 1) * logits
+
+    #     # Calculate predicted preference level: delta_hat = |R(a_W) - R(a_L)|
+    #     # Note: Based on the formula, it seems delta_hat uses the absolute difference
+    #     # between the *actual* computed rewards R(a_W) and R(a_L), which is |predicted_reward_diff|.
+    #     # delta_hat = torch.abs(predicted_reward_diff)
+    #     # However, the text defines delta_hat as |R(aW) - R(aL)| where aW and aL are the specific
+    #     # actions chosen. This implies using the absolute value of the difference calculated above.
+    #     delta_hat = torch.abs(predicted_reward_diff)
+    #     # An alternative interpretation could be delta_hat = |rewards_1 - rewards_0| = |logits|,
+    #     # if the formula meant the absolute difference between *any* pair's rewards.
+    #     # Let's stick to the definition based on R(aW) and R(aL).
+    #     # delta_hat = torch.abs(reward_W - reward_L) # which is predicted_reward_diff.abs()
+
+    #     # Identify the ground truth metrics for the winning (W) and losing (L) actions
+    #     # rmse_W = RMSE(a_t^W, a_t^*)
+    #     # rmse_L = RMSE(a_t^L, a_t^*)
+    #     # If choice=1, W is index_1, L is index_0. rmse_W=nrmse_1, rmse_L=nrmse_0
+    #     # If choice=0, W is index_0, L is index_1. rmse_W=nrmse_0, rmse_L=nrmse_1
+    #     rmse_W = choice_float * nrmse_1 + (1 - choice_float) * nrmse_0
+    #     rmse_L = choice_float * nrmse_0 + (1 - choice_float) * nrmse_1
+
+    #     # Calculate ground truth preference level: delta_star = |RMSE(a_W) - RMSE(a_L)|
+    #     delta_star = torch.abs(rmse_W - rmse_L)
+    #     # Note: This simplifies to torch.abs(nrmse_1 - nrmse_0)
+
+    #     # Define the hyperparameter alpha (should be configured appropriately)
+
+    #     # Calculate the penalty term: alpha * || delta_star - delta_hat ||^2_2
+    #     # Note: ||x||^2_2 is just x^2 for scalars.
+    #     preference_level_penalty = alpha * (delta_star - delta_hat)**2
+
+    #     # Calculate the argument for the sigmoid function in the loss formula:
+    #     # R(a_W) - R(a_L) - alpha * || delta_star - delta_hat ||^2_2
+    #     modified_reward_diff = predicted_reward_diff - preference_level_penalty
+
+    #     # Calculate the final loss using log sigmoid for numerical stability:
+    #     # Loss = -E[ log(sigma(modified_reward_diff)) ]
+    #     # This is equivalent to binary cross-entropy with logits where the target is always 1.
+    #     loss = -F.logsigmoid(modified_reward_diff).mean()
+
+    #     # --- End Modification ---
+
+    #     # Original regularization term (commented out as it's not in the provided formula)
+    #     # loss = loss + (rewards_1 + rewards_0).mean().abs() * 1e-3
+
+    #     # Log the original paired rewards for monitoring/debugging if needed
+    #     logged_rewards = torch.stack((rewards_1, rewards_0), dim=-1)
+
+    #     # Return loss, and optionally intermediate values for logging
+    #     return (loss, dict(logits=logged_rewards)) if return_outputs else loss
 
     # # bce + mse
     # def compute_loss(self, model, inputs, return_outputs=False):

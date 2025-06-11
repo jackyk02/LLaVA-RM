@@ -15,20 +15,20 @@ VISION_TOWER=openai/clip-vit-large-patch14-336
 LM_MODEL_NAME=LLaVA-RLHF-7b-v1.5-224/sft_model/
 
 # DATA CONFIG
-PREFERENCE_DATA=libero10_224_nrmse_ground.json
+PREFERENCE_DATA=libero10_0.1_nrmse_ground.json
 
 # SAVE CONFIG
-MODEL_NAME=LLaVA-RM-7b-libero-10-lora-bce-rank512-alpha128
+MODEL_NAME=LLaVA-RM-7b-libero-10-lora-bce-rank512-alpha128-0.1
 
 # WANDB CONFIG
-export WANDB_PROJECT="new-libero10"
+export WANDB_PROJECT="new-libero10-0.1"
 export WANDB_NAME="$MODEL_NAME-$(date +%Y%m%d_%H%M%S)"
 export WANDB_ENTITY="skyrobo"  # Replace with your wandb username or organization
 
 # TRAINING CONFIG
 NUM_EPOCHS=10
 LEARNING_RATE=2e-5
-BATCH_SIZE=32
+BATCH_SIZE=64
 GRAD_ACCUMULATION=1
 
 torchrun \
@@ -66,9 +66,9 @@ torchrun \
     --num_train_epochs $NUM_EPOCHS \
     --group_by_length False \
     --evaluation_strategy "steps" \
-    --eval_steps 250 \
+    --eval_steps 100 \
     --save_strategy "steps" \
-    --save_steps 250 \
+    --save_steps 100 \
     --save_total_limit 35 \
     --weight_decay 0.0 \
     --warmup_ratio 0.03 \
